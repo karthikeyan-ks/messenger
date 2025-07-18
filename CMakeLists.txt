@@ -10,7 +10,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     set(PLATFORM_SRC Platform/windows_platform.cpp)
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(PLATFORM_SRC Platform/mac_platform.cpp)
+    set(PLATFORM_SRC Platform/mac_platform.cpp
+            core/Task.h
+            core/TaskQueue.cpp
+            core/TaskQueue.h)
 else()
     message(FATAL_ERROR "Unsupported platform")
 endif()

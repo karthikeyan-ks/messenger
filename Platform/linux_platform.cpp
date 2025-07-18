@@ -2,21 +2,33 @@
 // Created by karthi on 15/07/25.
 //
 #include "platform.h"
+#include <sys/epoll.h>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
+#include <sstream>
 #include <unordered_set>
 #include <vector>
 #include <string>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <arpa/inet.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
 #include <openssl/sha.h>
+#include <csignal>
 
 using namespace std;
+static unordered_map<int, bool> handshakeDone;
+volatile sig_atomic_t keep_running = 1;
+
+void inthandler(int) {
+    cout << "Server shutting down..." << endl;
+    keep_running = 0;
+}
 
 string base64Encode(const unsigned char* input, int length) {
     BIO *bio, *b64;
@@ -101,6 +113,81 @@ vector<char> encodeWebSocketFrame(const string &message) {
     return frame;
 }
 
+
+int set_nonblocking(int fd) {
+    int flag = fcntl(fd, F_GETFL, 0);
+    if (flag == -1) return -1;
+    return fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+}
+
+bool performHandshake(int client_fd) {
+    char buffer[2048];
+    ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (n <= 0) return false;
+    buffer[n] = '\0';
+
+    std::string request(buffer);
+    std::string websocketKeyHeader = "Sec-WebSocket-Key: ";
+    size_t keyPos = request.find(websocketKeyHeader);
+    if (keyPos == std::string::npos) return false;
+
+    size_t keyStart = keyPos + websocketKeyHeader.length();
+    size_t keyEnd = request.find("\r\n", keyStart);
+    std::string clientKey = request.substr(keyStart, keyEnd - keyStart);
+
+    std::string magicGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::string acceptKey = clientKey + magicGUID;
+
+    // SHA1 Hash
+    unsigned char sha1Hash[SHA_DIGEST_LENGTH];
+    SHA1(reinterpret_cast<const unsigned char*>(acceptKey.c_str()), acceptKey.length(), sha1Hash);
+
+    // Base64 encode
+    std::string base64Key = base64Encode(sha1Hash, SHA_DIGEST_LENGTH);
+
+    ostringstream response;
+    response << "HTTP/1.1 101 Switching Protocols\r\n";
+    response << "Upgrade: websocket\r\n";
+    response << "Connection: Upgrade\r\n";
+    response << "Sec-WebSocket-Accept: " << base64Key << "\r\n\r\n";
+
+    send(client_fd, response.str().c_str(), response.str().length(), 0);
+    std::cout << "Handshake completed with client " << client_fd << std::endl;
+    return true;
+}
+
+void handleMessage(const int client_fd) {
+    if (!handshakeDone[client_fd]) {
+        if (performHandshake(client_fd)) handshakeDone[client_fd] = true;
+        else {
+            close(client_fd);
+            cout << "Client " << client_fd << " disconnected" << endl;
+        }
+        return;
+    }
+
+    char buffer[2048];
+    while (true) {
+        ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break; // No more data
+            close(client_fd);
+            cout << "Client " << client_fd << " disconnected" << endl;
+            return;
+        } else if (n == 0) {
+            close(client_fd);
+            cout << "Client " << client_fd << " disconnected" << endl;
+            return;
+        }
+
+        buffer[n] = '\0';
+        string decodeData = decodeWebSocketFrame(buffer, n);
+        cout << "Decoded " << decodeData << endl;
+    }
+}
+
+
 void createServer(int port, const string& hostname) {
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket < 0) {
@@ -130,94 +217,37 @@ void createServer(int port, const string& hostname) {
 
     cout << "WebSocket Server listening on port " << port << endl;
 
-    unordered_set<int> websocketClients;
-    fd_set masterSet, readSet;
-    FD_ZERO(&masterSet);
-    FD_SET(serverSocket, &masterSet);
-    int maxFd = serverSocket;
+    int epoll_fd = epoll_create1(0);
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.fd = serverSocket;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, serverSocket, &event);
+    epoll_event client_events[3000];
 
-    while (true) {
-        readSet = masterSet;
+    while (keep_running) {
+        signal(SIGINT, inthandler); // Ctrl+C handler
+        signal(SIGTERM, inthandler);
+        int n = epoll_wait(epoll_fd, client_events, 3000, -1);
+        for (int index = 0; index < n; index++) {
+            cout << "Client " << client_events[index].data.fd << " event changed " << endl;
+           if (client_events[index].data.fd == serverSocket) {
+               int client_fd = accept(serverSocket, nullptr, nullptr);
+               if (client_fd < 0) {
+                   perror("accept");
+                   continue;
+               }
+               set_nonblocking(client_fd);
+               epoll_event client_event{};
+               client_event.events = EPOLLIN | EPOLLET;
+               client_event.data.fd = client_fd;
+               epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event);
+               cout << "Client connected" << endl;
+           }else {
+               handleMessage(client_events[index].data.fd);
+           }
 
-        if (select(maxFd + 1, &readSet, nullptr, nullptr, nullptr) < 0) {
-            perror("select");
-            break;
-        }
-
-        for (int fd = 0; fd <= maxFd; fd++) {
-            if (!FD_ISSET(fd, &readSet)) continue;
-
-            if (fd == serverSocket) {
-                // Accept new connection
-                sockaddr_in client{};
-                socklen_t clientLen = sizeof(client);
-                int clientSocket = accept(serverSocket, reinterpret_cast<sockaddr*>(&client), &clientLen);
-                if (clientSocket < 0) {
-                    perror("accept");
-                    continue;
-                }
-
-                FD_SET(clientSocket, &masterSet);
-                if (clientSocket > maxFd) maxFd = clientSocket;
-
-                char ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &client.sin_addr, ip, INET_ADDRSTRLEN);
-                cout << "New connection from " << ip << ":" << ntohs(client.sin_port) << endl;
-
-            } else {
-                // Existing client sent data
-                char buffer[2048];
-                int bytesRead = recv(fd, buffer, sizeof(buffer), 0);
-                if (bytesRead <= 0) {
-                    if (bytesRead == 0)
-                        cout << "Client disconnected (fd: " << fd << ")" << endl;
-                    else
-                        perror("recv");
-
-                    close(fd);
-                    FD_CLR(fd, &masterSet);
-                    websocketClients.erase(fd);
-                    continue;
-                }
-
-                buffer[bytesRead] = '\0';
-
-                if (websocketClients.find(fd) == websocketClients.end()) {
-                    // Handle WebSocket handshake
-                    string request(buffer);
-                    size_t keyPos = request.find("Sec-WebSocket-Key: ");
-                    if (keyPos != string::npos) {
-                        keyPos += 19;
-                        size_t end = request.find("\r\n", keyPos);
-                        string clientKey = request.substr(keyPos, end - keyPos);
-                        string acceptKey = generateAcceptKey(clientKey);
-
-                        string response =
-                            "HTTP/1.1 101 Switching Protocols\r\n"
-                            "Upgrade: websocket\r\n"
-                            "Connection: Upgrade\r\n"
-                            "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
-
-                        send(fd, response.c_str(), response.size(), 0);
-                        websocketClients.insert(fd);
-                        cout << "Handshake complete for fd " << fd << endl;
-                    } else {
-                        cerr << "Invalid handshake from fd " << fd << endl;
-                        close(fd);
-                        FD_CLR(fd, &masterSet);
-                    }
-
-                } else {
-                    // Decode WebSocket message and echo
-                    string decoded = decodeWebSocketFrame(buffer, bytesRead);
-                    cout << "Message from fd " << fd << ": " << decoded << endl;
-
-                    vector<char> reply = encodeWebSocketFrame("Echo: " + decoded);
-                    send(fd, reply.data(), reply.size(), 0);
-                }
-            }
         }
     }
-
+    close(epoll_fd);
     close(serverSocket);
 }
